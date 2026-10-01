@@ -1,0 +1,22 @@
+# Base de datos
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Documentos subidos al sistema
+documentos/*
+
+# Python
+__pycache__/
+*.pyc
+
+# Entornos virtuales
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# Temporales
+.DS_Store
+Thumbs.db
