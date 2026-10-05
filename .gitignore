@@ -1,22 +1,37 @@
-# Base de datos
+# ============================================
+# UPRIT CONECTA - ARCHIVOS NO SUBIR A GITHUB
+# ============================================
+
+# Credenciales y secretos
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Base de datos local
 data/*.db
 data/*.sqlite
 data/*.sqlite3
 
-# Documentos subidos al sistema
+# Documentos y archivos subidos por usuarios
 documentos/*
+!documentos/.gitkeep
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Entornos virtuales
 venv/
 .venv/
+env/
 
 # VS Code
 .vscode/
 
-# Temporales
+# Sistema / temporales
 .DS_Store
 Thumbs.db
+*.tmp
+*.log

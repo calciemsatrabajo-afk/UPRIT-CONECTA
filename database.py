@@ -1,1353 +1,8073 @@
-import sqlite3
 import os
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import psycopg2
+
+from psycopg2.extras import RealDictCursor
+
+from psycopg2.pool import ThreadedConnectionPool
+
+import threading
+
+import atexit
+
+try:
+
+    import streamlit as st
+
+except Exception:
+
+    st = None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import bcrypt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from datetime import datetime
 
 
-# ============================================================
-# RUTAS
-# ============================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-DOCUMENTOS_DIR = os.path.join(BASE_DIR, "documentos")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DOCUMENTOS_DIR = os.path.join(BASE_DIR, 'documentos')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+VOUCHERS_DIR = os.path.join(DOCUMENTOS_DIR, 'vouchers')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CONOCIMIENTO_DIR = os.path.join(DOCUMENTOS_DIR, 'conocimiento')
+
+
+
+
+
+
+
+POSTULANTES_DIR = os.path.join(DOCUMENTOS_DIR, 'postulantes')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(DOCUMENTOS_DIR, exist_ok=True)
 
-DB_PATH = os.path.join(DATA_DIR, "uprit_conecta.db")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+os.makedirs(VOUCHERS_DIR, exist_ok=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+os.makedirs(CONOCIMIENTO_DIR, exist_ok=True)
+
+
+
+
+
+
+
+os.makedirs(POSTULANTES_DIR, exist_ok=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _database_url():
+
+    url = os.getenv("DATABASE_URL", "").strip()
+
+    if not url and st is not None:
+
+        try:
+
+            url = str(st.secrets.get("DATABASE_URL", "")).strip()
+
+        except Exception:
+
+            pass
+
+    if not url:
+
+        raise RuntimeError("Falta DATABASE_URL en .streamlit/secrets.toml o en las variables de entorno.")
+
+    return url
+
+
+
 
 
 # ============================================================
-# CONEXIÓN
-# ============================================================
 
-def conectar():
-    conexion = sqlite3.connect(DB_PATH)
-    conexion.row_factory = sqlite3.Row
-    conexion.execute("PRAGMA foreign_keys = ON")
-    return conexion
-
+# POOL DE CONEXIONES POSTGRESQL / SUPABASE
 
 # ============================================================
-# SEGURIDAD
-# ============================================================
 
-def generar_hash(password):
-    return bcrypt.hashpw(
-        password.encode("utf-8"),
-        bcrypt.gensalt()
-    ).decode("utf-8")
+# Streamlit reejecuta el script con frecuencia. Abrir una conexión TLS nueva
+
+# contra Supabase en cada SELECT agrega latencia. Este pool conserva un
+
+# pequeño grupo de conexiones reutilizables y es seguro para varios hilos.
+
+_POOL = None
+
+_POOL_LOCK = threading.Lock()
 
 
-def verificar_password(password, password_hash):
-    try:
-        return bcrypt.checkpw(
-            password.encode("utf-8"),
-            password_hash.encode("utf-8")
-        )
-    except Exception:
+
+def _crear_pool():
+
+    global _POOL
+
+    if _POOL is None:
+
+        with _POOL_LOCK:
+
+            if _POOL is None:
+
+                _POOL = ThreadedConnectionPool(
+
+                    minconn=1,
+
+                    maxconn=5,
+
+                    dsn=_database_url(),
+
+                    cursor_factory=RealDictCursor,
+
+                    connect_timeout=10,
+
+                    keepalives=1,
+
+                    keepalives_idle=30,
+
+                    keepalives_interval=10,
+
+                    keepalives_count=3,
+
+                    application_name="UPRIT_CONECTA",
+
+                    options="-c statement_timeout=15000 -c lock_timeout=5000",
+
+                )
+
+    return _POOL
+
+
+
+def _cerrar_pool():
+
+    global _POOL
+
+    if _POOL is not None:
+
+        try:
+
+            _POOL.closeall()
+
+        except Exception:
+
+            pass
+
+        _POOL = None
+
+
+
+atexit.register(_cerrar_pool)
+
+
+
+class _ConexionPool:
+
+    """Adaptador para que el resto del sistema pueda seguir usando con.close()
+
+    y `with conectar() as con`, devolviendo la conexión al pool en vez de
+
+    destruirla.
+
+    """
+
+    def __init__(self):
+
+        self._pool = _crear_pool()
+
+        self._con = self._obtener_conexion_valida()
+
+        self._devuelta = False
+
+
+
+    def _obtener_conexion_valida(self):
+
+        for _ in range(2):
+
+            con = self._pool.getconn()
+
+            if con is not None and not con.closed:
+
+                try:
+
+                    # Limpia cualquier transacción anterior antes de reutilizar.
+
+                    con.rollback()
+
+                except Exception:
+
+                    pass
+
+                return con
+
+            try:
+
+                self._pool.putconn(con, close=True)
+
+            except Exception:
+
+                pass
+
+        raise RuntimeError("No se pudo obtener una conexión válida a PostgreSQL/Supabase.")
+
+
+
+    def cursor(self, *args, **kwargs):
+
+        return self._con.cursor(*args, **kwargs)
+
+
+
+    def commit(self):
+
+        return self._con.commit()
+
+
+
+    def rollback(self):
+
+        return self._con.rollback()
+
+
+
+    @property
+
+    def closed(self):
+
+        return self._con.closed if self._con is not None else True
+
+
+
+    def close(self):
+
+        if self._devuelta:
+
+            return
+
+        self._devuelta = True
+
+        con, self._con = self._con, None
+
+        if con is None:
+
+            return
+
+        try:
+
+            if not con.closed:
+
+                try:
+
+                    con.rollback()
+
+                except Exception:
+
+                    pass
+
+                self._pool.putconn(con)
+
+            else:
+
+                self._pool.putconn(con, close=True)
+
+        except Exception:
+
+            try:
+
+                con.close()
+
+            except Exception:
+
+                pass
+
+
+
+    def __enter__(self):
+
+        return self
+
+
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+
+        try:
+
+            if self._con is not None and not self._con.closed:
+
+                if exc_type is None:
+
+                    self._con.commit()
+
+                else:
+
+                    self._con.rollback()
+
+        finally:
+
+            self.close()
+
         return False
 
 
-# ============================================================
-# BASE DE DATOS
-# ============================================================
 
-def crear_base_datos():
+    def __getattr__(self, name):
 
-    con = conectar()
+        # Compatibilidad con atributos/métodos de psycopg2 usados por código
+
+        # existente.
+
+        if name.startswith("_"):
+
+            raise AttributeError(name)
+
+        return getattr(self._con, name)
+
+
+
+def _sql(sql):
+
+    return sql
+
+
+
+def conectar():
+
+    return _ConexionPool()
+
+
+# Alias público para pruebas y compatibilidad.
+def get_connection():
+    return conectar()
+
+
+
+def _execute(con, sql, params=()):
+
     cur = con.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS facultades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL UNIQUE,
-            activo INTEGER DEFAULT 1
-        )
-    """)
+    cur.execute(_sql(sql), params)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS escuelas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            facultad_id INTEGER NOT NULL,
-            nombre TEXT NOT NULL,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre_completo TEXT NOT NULL,
-            dni TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            rol TEXT DEFAULT 'usuario',
-            facultad_id INTEGER,
-            escuela_id INTEGER,
-            estado TEXT DEFAULT 'activo',
-            fecha_registro TEXT,
-            ultimo_acceso TEXT,
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id),
-            FOREIGN KEY (escuela_id) REFERENCES escuelas(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS areas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL UNIQUE,
-            descripcion TEXT,
-            activo INTEGER DEFAULT 1
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS directorio (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            area_id INTEGER,
-            responsable TEXT,
-            cargo TEXT,
-            correo TEXT,
-            correo_copia TEXT,
-            telefono TEXT,
-            whatsapp TEXT,
-            anexo TEXT,
-            horario TEXT,
-            ubicacion TEXT,
-            descripcion TEXT,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (area_id) REFERENCES areas(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS comunicados (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            titulo TEXT NOT NULL,
-            contenido TEXT NOT NULL,
-            tipo TEXT DEFAULT 'Informativo',
-            facultad_id INTEGER,
-            escuela_id INTEGER,
-            mostrar_novedad INTEGER DEFAULT 1,
-            fecha_publicacion TEXT,
-            fecha_vencimiento TEXT,
-            creado_por INTEGER,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id),
-            FOREIGN KEY (escuela_id) REFERENCES escuelas(id),
-            FOREIGN KEY (creado_por) REFERENCES usuarios(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS documentos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            titulo TEXT NOT NULL,
-            descripcion TEXT,
-            categoria TEXT,
-            archivo TEXT,
-            nombre_original TEXT,
-            tipo_archivo TEXT,
-            facultad_id INTEGER,
-            escuela_id INTEGER,
-            fecha_publicacion TEXT,
-            fecha_actualizacion TEXT,
-            version INTEGER DEFAULT 1,
-            creado_por INTEGER,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id),
-            FOREIGN KEY (escuela_id) REFERENCES escuelas(id),
-            FOREIGN KEY (creado_por) REFERENCES usuarios(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS procedimientos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            titulo TEXT NOT NULL,
-            categoria TEXT,
-            descripcion TEXT,
-            pasos TEXT,
-            requisitos TEXT,
-            documentos_necesarios TEXT,
-            area_id INTEGER,
-            facultad_id INTEGER,
-            escuela_id INTEGER,
-            fecha_actualizacion TEXT,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (area_id) REFERENCES areas(id),
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id),
-            FOREIGN KEY (escuela_id) REFERENCES escuelas(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS calendario (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            titulo TEXT NOT NULL,
-            descripcion TEXT,
-            fecha_inicio TEXT,
-            fecha_fin TEXT,
-            tipo TEXT,
-            facultad_id INTEGER,
-            escuela_id INTEGER,
-            importante INTEGER DEFAULT 0,
-            creado_por INTEGER,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id),
-            FOREIGN KEY (escuela_id) REFERENCES escuelas(id),
-            FOREIGN KEY (creado_por) REFERENCES usuarios(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS preguntas_frecuentes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pregunta TEXT NOT NULL,
-            respuesta TEXT NOT NULL,
-            categoria TEXT,
-            area_id INTEGER,
-            facultad_id INTEGER,
-            escuela_id INTEGER,
-            activo INTEGER DEFAULT 1,
-            FOREIGN KEY (area_id) REFERENCES areas(id),
-            FOREIGN KEY (facultad_id) REFERENCES facultades(id),
-            FOREIGN KEY (escuela_id) REFERENCES escuelas(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS auditoria (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            usuario_id INTEGER,
-            accion TEXT,
-            modulo TEXT,
-            detalle TEXT,
-            fecha TEXT,
-            FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
-        )
-    """)
-
-    con.commit()
-    con.close()
-
-    cargar_datos_iniciales()
+    return cur
 
 
-# ============================================================
-# DATOS INICIALES
-# ============================================================
 
-def cargar_datos_iniciales():
+def filas(sql, params=()):
 
-    con = conectar()
-    cur = con.cursor()
+    with conectar() as con:
 
-    facultades = [
-        "Facultad de Ingeniería",
-        "Facultad de Ciencias Empresariales",
-        "Facultad de Derecho y Humanidades"
-    ]
+        cur = _execute(con, sql, params)
 
-    for nombre in facultades:
-        cur.execute(
-            "INSERT OR IGNORE INTO facultades(nombre) VALUES (?)",
-            (nombre,)
-        )
+        try:
 
-    con.commit()
+            return [dict(x) for x in cur.fetchall()]
 
-    cur.execute("SELECT id,nombre FROM facultades")
-    fac = {x["nombre"]: x["id"] for x in cur.fetchall()}
+        finally:
 
-    escuelas = [
-        (fac["Facultad de Ingeniería"], "Ingeniería Industrial"),
-        (
-            fac["Facultad de Ingeniería"],
-            "Ingeniería de Sistemas e Inteligencia Artificial"
-        ),
-        (
-            fac["Facultad de Ciencias Empresariales"],
-            "Administración"
-        ),
-        (
-            fac["Facultad de Ciencias Empresariales"],
-            "Contabilidad"
-        ),
-        (
-            fac["Facultad de Derecho y Humanidades"],
-            "Derecho"
-        )
-    ]
-
-    for facultad_id, nombre in escuelas:
-        cur.execute("""
-            SELECT id FROM escuelas
-            WHERE facultad_id=? AND nombre=?
-        """, (facultad_id, nombre))
-
-        if not cur.fetchone():
-            cur.execute("""
-                INSERT INTO escuelas(facultad_id,nombre)
-                VALUES (?,?)
-            """, (facultad_id, nombre))
-
-    areas = [
-        ("Tesorería", "Pagos, pensiones y asuntos económicos."),
-        (
-            "Registros Académicos",
-            "Matrícula y trámites académicos."
-        ),
-        (
-            "Bienestar Universitario",
-            "Bienestar y orientación al estudiante."
-        ),
-        ("Secretaría", "Atención administrativa."),
-        (
-            "Soporte Tecnológico / DTI",
-            "Moodle, intranet y soporte tecnológico."
-        ),
-        (
-            "Coordinación Académica",
-            "Notas, docentes y convalidaciones."
-        )
-    ]
-
-    for nombre, descripcion in areas:
-        cur.execute("""
-            INSERT OR IGNORE INTO areas(nombre,descripcion)
-            VALUES (?,?)
-        """, (nombre, descripcion))
-
-    con.commit()
-
-    contactos = [
-        (
-            "Tesorería",
-            "tesoreria@uprit.edu.pe",
-            "elser.guevara@uprit.edu.pe"
-        ),
-        (
-            "Registros Académicos",
-            "registro.academico@uprit.edu.pe",
-            ""
-        ),
-        (
-            "Bienestar Universitario",
-            "bienestar.universitario@uprit.edu.pe",
-            ""
-        ),
-        ("Secretaría", "sonia.cuba@uprit.edu.pe", ""),
-        (
-            "Soporte Tecnológico / DTI",
-            "carlos.haro@uprit.edu.pe",
-            ""
-        ),
-        (
-            "Coordinación Académica",
-            "enrique.boy@uprit.edu.pe",
-            ""
-        )
-    ]
-
-    for area, correo, copia in contactos:
-
-        cur.execute(
-            "SELECT id FROM areas WHERE nombre=?",
-            (area,)
-        )
-
-        fila = cur.fetchone()
-
-        if fila:
-            cur.execute(
-                "SELECT id FROM directorio WHERE area_id=?",
-                (fila["id"],)
-            )
-
-            if not cur.fetchone():
-                cur.execute("""
-                    INSERT INTO directorio(
-                        area_id,correo,correo_copia
-                    ) VALUES (?,?,?)
-                """, (fila["id"], correo, copia))
-
-    cur.execute(
-        "SELECT id FROM usuarios WHERE dni='admin'"
-    )
-
-    if not cur.fetchone():
-        cur.execute("""
-            INSERT INTO usuarios(
-                nombre_completo,
-                dni,
-                password_hash,
-                rol,
-                estado,
-                fecha_registro
-            )
-            VALUES (?,?,?,?,?,?)
-        """, (
-            "Administrador General",
-            "admin",
-            generar_hash("Admin123*"),
-            "administrador",
-            "activo",
-            ahora()
-        ))
-
-    con.commit()
-    con.close()
+            cur.close()
 
 
-# ============================================================
-# UTILIDADES
-# ============================================================
+
+def fila(sql, params=()):
+
+    with conectar() as con:
+
+        cur = _execute(con, sql, params)
+
+        try:
+
+            r = cur.fetchone()
+
+            return dict(r) if r else None
+
+        finally:
+
+            cur.close()
+
+
+
+def ejecutar(sql, params=()):
+
+    with conectar() as con:
+
+        cur = _execute(con, sql, params)
+
+        try:
+
+            nuevo_id = None
+
+            if sql.lstrip().upper().startswith("INSERT"):
+
+                # Mantiene compatibilidad con las funciones actuales sin
+
+                # obligar a reescribir todos los INSERT con RETURNING.
+
+                cur.execute("SELECT LASTVAL() AS id")
+
+                row = cur.fetchone()
+
+                nuevo_id = row["id"] if row else None
+
+            return nuevo_id if nuevo_id is not None else cur.rowcount
+
+        finally:
+
+            cur.close()
+
+
 
 def ahora():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def filas(sql, parametros=()):
-    con = conectar()
-    cur = con.cursor()
-    cur.execute(sql, parametros)
-    resultado = [dict(x) for x in cur.fetchall()]
-    con.close()
-    return resultado
 
 
-def ejecutar(sql, parametros=()):
-    con = conectar()
-    cur = con.cursor()
-    cur.execute(sql, parametros)
-    ultimo_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return ultimo_id
 
 
-# ============================================================
-# AUDITORÍA
-# ============================================================
-
-def registrar_auditoria(usuario_id, accion, modulo, detalle=""):
-    ejecutar("""
-        INSERT INTO auditoria(
-            usuario_id,accion,modulo,detalle,fecha
-        ) VALUES (?,?,?,?,?)
-    """, (usuario_id, accion, modulo, detalle, ahora()))
 
 
-def obtener_auditoria():
-    return filas("""
-        SELECT
-            a.*,
-            u.nombre_completo AS usuario_nombre
-        FROM auditoria a
-        LEFT JOIN usuarios u ON a.usuario_id=u.id
-        ORDER BY a.id DESC
-        LIMIT 500
-    """)
 
 
-# ============================================================
-# FACULTADES / ESCUELAS
-# ============================================================
-
-def obtener_facultades(incluir_inactivas=False):
-    if incluir_inactivas:
-        return filas(
-            "SELECT * FROM facultades ORDER BY nombre"
-        )
-
-    return filas("""
-        SELECT * FROM facultades
-        WHERE activo=1 ORDER BY nombre
-    """)
 
 
-def obtener_escuelas(facultad_id, incluir_inactivas=False):
-    if incluir_inactivas:
-        return filas("""
-            SELECT * FROM escuelas
-            WHERE facultad_id=?
-            ORDER BY nombre
-        """, (facultad_id,))
-
-    return filas("""
-        SELECT * FROM escuelas
-        WHERE facultad_id=? AND activo=1
-        ORDER BY nombre
-    """, (facultad_id,))
 
 
-def crear_facultad(nombre, usuario_id):
+
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+
+
+
+def generar_hash(password):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def verificar_password(password, password_hash):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     try:
-        ejecutar(
-            "INSERT INTO facultades(nombre) VALUES (?)",
-            (nombre.strip(),)
-        )
-        registrar_auditoria(
-            usuario_id, "Crear", "Facultades", nombre
-        )
-        return True, "Facultad creada correctamente."
-    except sqlite3.IntegrityError:
-        return False, "La facultad ya existe."
-
-
-def crear_escuela(facultad_id, nombre, usuario_id):
-    ejecutar("""
-        INSERT INTO escuelas(facultad_id,nombre)
-        VALUES (?,?)
-    """, (facultad_id, nombre.strip()))
-
-    registrar_auditoria(
-        usuario_id, "Crear", "Escuelas", nombre
-    )
-
-    return True, "Escuela creada correctamente."
-
-
-def cambiar_estado_facultad(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE facultades SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id, "Cambiar estado", "Facultades", str(id_)
-    )
-
-
-def cambiar_estado_escuela(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE escuelas SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id, "Cambiar estado", "Escuelas", str(id_)
-    )
-
-
-# ============================================================
-# USUARIOS
-# ============================================================
-
-def registrar_usuario(
-    nombre,
-    dni,
-    password,
-    facultad_id,
-    escuela_id
-):
-    nombre = nombre.strip()
-    dni = dni.strip()
-
-    if not nombre:
-        return False, "Ingrese su nombre completo."
-
-    if not dni.isdigit() or len(dni) != 8:
-        return False, "El DNI debe tener 8 números."
-
-    if len(password) < 4:
-        return False, "La contraseña debe tener mínimo 4 caracteres."
-
-    if filas(
-        "SELECT id FROM usuarios WHERE dni=?",
-        (dni,)
-    ):
-        return False, "El DNI ya está registrado."
-
-    ejecutar("""
-        INSERT INTO usuarios(
-            nombre_completo,dni,password_hash,rol,
-            facultad_id,escuela_id,estado,fecha_registro
-        )
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (
-        nombre,
-        dni,
-        generar_hash(password),
-        "usuario",
-        facultad_id,
-        escuela_id,
-        "activo",
-        ahora()
-    ))
-
-    return True, "Cuenta creada correctamente."
-
-
-def autenticar_usuario(dni, password):
-
-    resultado = filas("""
-        SELECT
-            u.*,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM usuarios u
-        LEFT JOIN facultades f ON u.facultad_id=f.id
-        LEFT JOIN escuelas e ON u.escuela_id=e.id
-        WHERE u.dni=?
-    """, (dni.strip(),))
-
-    if not resultado:
-        return None
-
-    usuario = resultado[0]
-
-    if usuario["estado"] != "activo":
-        return None
-
-    if not verificar_password(
-        password,
-        usuario["password_hash"]
-    ):
-        return None
-
-    ejecutar(
-        "UPDATE usuarios SET ultimo_acceso=? WHERE id=?",
-        (ahora(), usuario["id"])
-    )
-
-    return usuario
-
-
-def obtener_usuarios():
-    return filas("""
-        SELECT
-            u.id,u.nombre_completo,u.dni,u.rol,
-            u.estado,u.fecha_registro,u.ultimo_acceso,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM usuarios u
-        LEFT JOIN facultades f ON u.facultad_id=f.id
-        LEFT JOIN escuelas e ON u.escuela_id=e.id
-        ORDER BY u.id DESC
-    """)
-
-
-def cambiar_estado_usuario(usuario_id, estado, admin_id):
-    ejecutar(
-        "UPDATE usuarios SET estado=? WHERE id=?",
-        (estado, usuario_id)
-    )
-    registrar_auditoria(
-        admin_id,
-        "Cambiar estado",
-        "Usuarios",
-        f"Usuario #{usuario_id}: {estado}"
-    )
-
-
-# ============================================================
-# COMUNICADOS / ALERTAS
-# ============================================================
-
-def crear_comunicado(
-    titulo,
-    contenido,
-    tipo,
-    facultad_id,
-    escuela_id,
-    creado_por,
-    fecha_vencimiento=None,
-    mostrar_novedad=1
-):
-    if not titulo.strip() or not contenido.strip():
-        return False, "Título y contenido son obligatorios."
-
-    id_ = ejecutar("""
-        INSERT INTO comunicados(
-            titulo,contenido,tipo,facultad_id,escuela_id,
-            mostrar_novedad,fecha_publicacion,
-            fecha_vencimiento,creado_por,activo
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,1)
-    """, (
-        titulo.strip(),
-        contenido.strip(),
-        tipo,
-        facultad_id,
-        escuela_id,
-        mostrar_novedad,
-        ahora(),
-        fecha_vencimiento,
-        creado_por
-    ))
-
-    registrar_auditoria(
-        creado_por,
-        "Publicar",
-        "Comunicados",
-        f"#{id_} {titulo}"
-    )
-
-    return True, "Publicado correctamente."
-
-
-def obtener_comunicados_admin():
-    return filas("""
-        SELECT
-            c.*,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre,
-            u.nombre_completo AS autor_nombre
-        FROM comunicados c
-        LEFT JOIN facultades f ON c.facultad_id=f.id
-        LEFT JOIN escuelas e ON c.escuela_id=e.id
-        LEFT JOIN usuarios u ON c.creado_por=u.id
-        ORDER BY c.id DESC
-    """)
-
-
-def obtener_comunicados_usuario(facultad_id, escuela_id):
-    fecha = datetime.now().strftime("%Y-%m-%d")
-
-    return filas("""
-        SELECT
-            c.*,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM comunicados c
-        LEFT JOIN facultades f ON c.facultad_id=f.id
-        LEFT JOIN escuelas e ON c.escuela_id=e.id
-        WHERE c.activo=1
-        AND (c.facultad_id IS NULL OR c.facultad_id=?)
-        AND (c.escuela_id IS NULL OR c.escuela_id=?)
-        AND (
-            c.fecha_vencimiento IS NULL
-            OR c.fecha_vencimiento=''
-            OR substr(c.fecha_vencimiento,1,10)>=?
-        )
-        ORDER BY
-        CASE c.tipo
-            WHEN 'Urgente' THEN 1
-            WHEN 'Importante' THEN 2
-            ELSE 3
-        END,
-        c.id DESC
-    """, (facultad_id, escuela_id, fecha))
-
-
-def cambiar_estado_comunicado(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE comunicados SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Cambiar estado",
-        "Comunicados",
-        str(id_)
-    )
-
-
-def eliminar_comunicado(id_, usuario_id):
-    ejecutar(
-        "DELETE FROM comunicados WHERE id=?",
-        (id_,)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Eliminar",
-        "Comunicados",
-        str(id_)
-    )
-
-
-# ============================================================
-# DOCUMENTOS
-# ============================================================
-
-def crear_documento(
-    titulo,
-    descripcion,
-    categoria,
-    archivo,
-    nombre_original,
-    tipo_archivo,
-    facultad_id,
-    escuela_id,
-    creado_por
-):
-    id_ = ejecutar("""
-        INSERT INTO documentos(
-            titulo,descripcion,categoria,archivo,
-            nombre_original,tipo_archivo,
-            facultad_id,escuela_id,
-            fecha_publicacion,fecha_actualizacion,
-            version,creado_por,activo
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,1,?,1)
-    """, (
-        titulo.strip(),
-        descripcion.strip(),
-        categoria,
-        archivo,
-        nombre_original,
-        tipo_archivo,
-        facultad_id,
-        escuela_id,
-        ahora(),
-        ahora(),
-        creado_por
-    ))
-
-    registrar_auditoria(
-        creado_por,
-        "Subir",
-        "Documentos",
-        f"#{id_} {titulo}"
-    )
-
-    return True, "Documento publicado."
-
-
-def obtener_documentos_admin():
-    return filas("""
-        SELECT
-            d.*,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM documentos d
-        LEFT JOIN facultades f ON d.facultad_id=f.id
-        LEFT JOIN escuelas e ON d.escuela_id=e.id
-        ORDER BY d.id DESC
-    """)
-
-
-def obtener_documentos_usuario(facultad_id, escuela_id):
-    return filas("""
-        SELECT
-            d.*,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM documentos d
-        LEFT JOIN facultades f ON d.facultad_id=f.id
-        LEFT JOIN escuelas e ON d.escuela_id=e.id
-        WHERE d.activo=1
-        AND (d.facultad_id IS NULL OR d.facultad_id=?)
-        AND (d.escuela_id IS NULL OR d.escuela_id=?)
-        ORDER BY d.id DESC
-    """, (facultad_id, escuela_id))
-
-
-def cambiar_estado_documento(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE documentos SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Cambiar estado",
-        "Documentos",
-        str(id_)
-    )
-
-
-def eliminar_documento(id_, usuario_id):
-
-    docs = filas(
-        "SELECT archivo FROM documentos WHERE id=?",
-        (id_,)
-    )
-
-    ejecutar(
-        "DELETE FROM documentos WHERE id=?",
-        (id_,)
-    )
-
-    if docs:
-        ruta = docs[0]["archivo"]
-
-        if ruta and os.path.exists(ruta):
-            try:
-                os.remove(ruta)
-            except Exception:
-                pass
-
-    registrar_auditoria(
-        usuario_id,
-        "Eliminar",
-        "Documentos",
-        str(id_)
-    )
-
-
-# ============================================================
-# ÁREAS / DIRECTORIO
-# ============================================================
-
-def obtener_areas():
-    return filas("""
-        SELECT * FROM areas
-        WHERE activo=1
-        ORDER BY nombre
-    """)
-
-
-def obtener_directorio(incluir_inactivos=False):
-
-    condicion = "" if incluir_inactivos else "WHERE d.activo=1"
-
-    return filas(f"""
-        SELECT
-            d.*,
-            a.nombre AS area_nombre
-        FROM directorio d
-        LEFT JOIN areas a ON d.area_id=a.id
-        {condicion}
-        ORDER BY a.nombre
-    """)
-
-
-def crear_contacto_directorio(
-    area_id,
-    responsable,
-    cargo,
-    correo,
-    correo_copia,
-    telefono,
-    whatsapp,
-    anexo,
-    horario,
-    ubicacion,
-    descripcion,
-    usuario_id
-):
-    id_ = ejecutar("""
-        INSERT INTO directorio(
-            area_id,responsable,cargo,correo,correo_copia,
-            telefono,whatsapp,anexo,horario,ubicacion,
-            descripcion,activo
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,1)
-    """, (
-        area_id,
-        responsable,
-        cargo,
-        correo,
-        correo_copia,
-        telefono,
-        whatsapp,
-        anexo,
-        horario,
-        ubicacion,
-        descripcion
-    ))
-
-    registrar_auditoria(
-        usuario_id,
-        "Crear",
-        "Directorio",
-        str(id_)
-    )
-
-
-def actualizar_contacto_directorio(
-    id_,
-    responsable,
-    cargo,
-    correo,
-    correo_copia,
-    telefono,
-    whatsapp,
-    anexo,
-    horario,
-    ubicacion,
-    descripcion,
-    usuario_id
-):
-    ejecutar("""
-        UPDATE directorio SET
-            responsable=?,
-            cargo=?,
-            correo=?,
-            correo_copia=?,
-            telefono=?,
-            whatsapp=?,
-            anexo=?,
-            horario=?,
-            ubicacion=?,
-            descripcion=?
-        WHERE id=?
-    """, (
-        responsable,
-        cargo,
-        correo,
-        correo_copia,
-        telefono,
-        whatsapp,
-        anexo,
-        horario,
-        ubicacion,
-        descripcion,
-        id_
-    ))
-
-    registrar_auditoria(
-        usuario_id,
-        "Actualizar",
-        "Directorio",
-        str(id_)
-    )
-
-
-def eliminar_contacto_directorio(id_, usuario_id):
-    ejecutar(
-        "DELETE FROM directorio WHERE id=?",
-        (id_,)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Eliminar",
-        "Directorio",
-        str(id_)
-    )
-
-
-# ============================================================
-# PROCEDIMIENTOS
-# ============================================================
-
-def crear_procedimiento(
-    titulo,
-    categoria,
-    descripcion,
-    pasos,
-    requisitos,
-    documentos,
-    area_id,
-    facultad_id,
-    escuela_id,
-    usuario_id
-):
-    id_ = ejecutar("""
-        INSERT INTO procedimientos(
-            titulo,categoria,descripcion,pasos,requisitos,
-            documentos_necesarios,area_id,facultad_id,
-            escuela_id,fecha_actualizacion,activo
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,1)
-    """, (
-        titulo,
-        categoria,
-        descripcion,
-        pasos,
-        requisitos,
-        documentos,
-        area_id,
-        facultad_id,
-        escuela_id,
-        ahora()
-    ))
-
-    registrar_auditoria(
-        usuario_id,
-        "Crear",
-        "Procedimientos",
-        f"#{id_} {titulo}"
-    )
-
-
-def obtener_procedimientos(
-    facultad_id=None,
-    escuela_id=None,
-    admin=False
-):
-    if admin:
-        return filas("""
-            SELECT
-                p.*,
-                a.nombre AS area_nombre,
-                f.nombre AS facultad_nombre,
-                e.nombre AS escuela_nombre
-            FROM procedimientos p
-            LEFT JOIN areas a ON p.area_id=a.id
-            LEFT JOIN facultades f ON p.facultad_id=f.id
-            LEFT JOIN escuelas e ON p.escuela_id=e.id
-            ORDER BY p.id DESC
-        """)
-
-    return filas("""
-        SELECT
-            p.*,
-            a.nombre AS area_nombre,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM procedimientos p
-        LEFT JOIN areas a ON p.area_id=a.id
-        LEFT JOIN facultades f ON p.facultad_id=f.id
-        LEFT JOIN escuelas e ON p.escuela_id=e.id
-        WHERE p.activo=1
-        AND (p.facultad_id IS NULL OR p.facultad_id=?)
-        AND (p.escuela_id IS NULL OR p.escuela_id=?)
-        ORDER BY p.id DESC
-    """, (facultad_id, escuela_id))
-
-
-def cambiar_estado_procedimiento(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE procedimientos SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Cambiar estado",
-        "Procedimientos",
-        str(id_)
-    )
-
-
-def eliminar_procedimiento(id_, usuario_id):
-    ejecutar(
-        "DELETE FROM procedimientos WHERE id=?",
-        (id_,)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Eliminar",
-        "Procedimientos",
-        str(id_)
-    )
-
-
-# ============================================================
-# CALENDARIO
-# ============================================================
-
-def crear_evento(
-    titulo,
-    descripcion,
-    fecha_inicio,
-    fecha_fin,
-    tipo,
-    facultad_id,
-    escuela_id,
-    importante,
-    usuario_id
-):
-    id_ = ejecutar("""
-        INSERT INTO calendario(
-            titulo,descripcion,fecha_inicio,fecha_fin,tipo,
-            facultad_id,escuela_id,importante,
-            creado_por,activo
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,1)
-    """, (
-        titulo,
-        descripcion,
-        fecha_inicio,
-        fecha_fin,
-        tipo,
-        facultad_id,
-        escuela_id,
-        importante,
-        usuario_id
-    ))
-
-    registrar_auditoria(
-        usuario_id,
-        "Crear",
-        "Calendario",
-        f"#{id_} {titulo}"
-    )
-
-
-def obtener_eventos(
-    facultad_id=None,
-    escuela_id=None,
-    admin=False
-):
-    if admin:
-        return filas("""
-            SELECT
-                c.*,
-                f.nombre AS facultad_nombre,
-                e.nombre AS escuela_nombre
-            FROM calendario c
-            LEFT JOIN facultades f ON c.facultad_id=f.id
-            LEFT JOIN escuelas e ON c.escuela_id=e.id
-            ORDER BY c.fecha_inicio DESC
-        """)
-
-    return filas("""
-        SELECT
-            c.*,
-            f.nombre AS facultad_nombre,
-            e.nombre AS escuela_nombre
-        FROM calendario c
-        LEFT JOIN facultades f ON c.facultad_id=f.id
-        LEFT JOIN escuelas e ON c.escuela_id=e.id
-        WHERE c.activo=1
-        AND (c.facultad_id IS NULL OR c.facultad_id=?)
-        AND (c.escuela_id IS NULL OR c.escuela_id=?)
-        ORDER BY c.fecha_inicio ASC
-    """, (facultad_id, escuela_id))
-
-
-def cambiar_estado_evento(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE calendario SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Cambiar estado",
-        "Calendario",
-        str(id_)
-    )
-
-
-def eliminar_evento(id_, usuario_id):
-    ejecutar(
-        "DELETE FROM calendario WHERE id=?",
-        (id_,)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Eliminar",
-        "Calendario",
-        str(id_)
-    )
-
-
-# ============================================================
-# PREGUNTAS FRECUENTES
-# ============================================================
-
-def crear_pregunta(
-    pregunta,
-    respuesta,
-    categoria,
-    area_id,
-    facultad_id,
-    escuela_id,
-    usuario_id
-):
-    id_ = ejecutar("""
-        INSERT INTO preguntas_frecuentes(
-            pregunta,respuesta,categoria,area_id,
-            facultad_id,escuela_id,activo
-        )
-        VALUES (?,?,?,?,?,?,1)
-    """, (
-        pregunta,
-        respuesta,
-        categoria,
-        area_id,
-        facultad_id,
-        escuela_id
-    ))
-
-    registrar_auditoria(
-        usuario_id,
-        "Crear",
-        "Preguntas frecuentes",
-        f"#{id_} {pregunta}"
-    )
-
-
-def obtener_preguntas(
-    facultad_id=None,
-    escuela_id=None,
-    admin=False
-):
-    if admin:
-        return filas("""
-            SELECT
-                p.*,
-                a.nombre AS area_nombre,
-                f.nombre AS facultad_nombre,
-                e.nombre AS escuela_nombre
-            FROM preguntas_frecuentes p
-            LEFT JOIN areas a ON p.area_id=a.id
-            LEFT JOIN facultades f ON p.facultad_id=f.id
-            LEFT JOIN escuelas e ON p.escuela_id=e.id
-            ORDER BY p.id DESC
-        """)
-
-    return filas("""
-        SELECT
-            p.*,
-            a.nombre AS area_nombre
-        FROM preguntas_frecuentes p
-        LEFT JOIN areas a ON p.area_id=a.id
-        WHERE p.activo=1
-        AND (p.facultad_id IS NULL OR p.facultad_id=?)
-        AND (p.escuela_id IS NULL OR p.escuela_id=?)
-        ORDER BY p.categoria,p.id
-    """, (facultad_id, escuela_id))
-
-
-def cambiar_estado_pregunta(id_, activo, usuario_id):
-    ejecutar(
-        "UPDATE preguntas_frecuentes SET activo=? WHERE id=?",
-        (activo, id_)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Cambiar estado",
-        "Preguntas frecuentes",
-        str(id_)
-    )
-
-
-def eliminar_pregunta(id_, usuario_id):
-    ejecutar(
-        "DELETE FROM preguntas_frecuentes WHERE id=?",
-        (id_,)
-    )
-    registrar_auditoria(
-        usuario_id,
-        "Eliminar",
-        "Preguntas frecuentes",
-        str(id_)
-    )
-
-
-# ============================================================
-# MÉTRICAS
-# ============================================================
-
-def obtener_metricas():
-
-    def contar(tabla, condicion="1=1"):
-        resultado = filas(
-            f"SELECT COUNT(*) AS total FROM {tabla} WHERE {condicion}"
-        )
-        return resultado[0]["total"]
-
-    return {
-        "usuarios": contar("usuarios", "rol='usuario'"),
-        "comunicados": contar("comunicados", "activo=1"),
-        "alertas": contar(
-            "comunicados",
-            "activo=1 AND tipo='Urgente'"
-        ),
-        "documentos": contar("documentos", "activo=1"),
-        "procedimientos": contar("procedimientos", "activo=1"),
-        "eventos": contar("calendario", "activo=1"),
-        "preguntas": contar(
-            "preguntas_frecuentes",
-            "activo=1"
-        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _columnas(con, tabla):
+
+    cur = con.cursor()
+
+    cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (tabla,))
+
+    return {r['column_name'] for r in cur.fetchall()}
+
+
+
+def _asegurar_columna(con, tabla, nombre, definicion):
+
+    if nombre not in _columnas(con, tabla):
+
+        cur = con.cursor()
+
+        cur.execute(f'ALTER TABLE {tabla} ADD COLUMN {nombre} {definicion}')
+
+
+
+
+
+ESTRUCTURA = {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    'Pregrado': {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Facultad de Ciencias Empresariales': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Administración de Empresas',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Administración Portuaria y de Transporte Intermodal',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Contabilidad y Finanzas',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Marketing Digital y Negocios Internacionales',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Psicología',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Facultad de Derecho y Ciencias Sociales': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Derecho (A Distancia)', 'Derecho (Presencial)',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación con Mención en Ciencias Naturales y Tecnología',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación con mención en Comunicación, Literatura y Lingüística',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación con mención en Idiomas Extranjeros',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación con Mención en Matemática e Informática',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación Física y Ciencias del Deporte', 'Educación Inicial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación Primaria',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Educación Secundaria con Mención en Ciencias Sociales',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Facultad de Ingeniería y Arquitectura': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Ingeniería Civil',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Ingeniería de Sistemas e Inteligencia Artificial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Ingeniería Industrial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    },
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    'Posgrado': {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Posgrado Administración': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Administración de Organizaciones (MBA)',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Marketing Digital e Inteligencia Artificial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Marketing y Gestión Comercial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Doctorado en Ciencias de la Administración',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Posgrado Derecho': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Anticorrupción, Lavado de Activos y Delitos Conexos',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Civil y Comercial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Constitucional y Administrativo',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Laboral y Seguridad Social',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Penal y Criminología',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Tecnológico y Propiedad Intelectual',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Doctorado en Derecho e Investigación Jurídica',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Posgrado Educación': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Ciencias de la Educación y Gestión Educativa',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Educación en Entornos Virtuales y Tecnología Educativa',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Investigación y Docencia Universitaria',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Psicología Educativa y Psicopedagogía',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Doctorado en Ciencias de la Educación',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Posgrado Gestión Pública': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Derecho Administrativo y Gestión Pública',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Gestión Pública',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Gestión Pública y Control Gubernamental',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Posgrado Ingeniería y Gerencia de Proyectos': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Gerencia de Proyectos de Construcción',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Gerencia de Proyectos e Inteligencia Artificial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Gestión de Negocios Inmobiliarios y Urbanismo',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Maestría en Gestión de Proyectos BIM',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ],
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    },
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    'Segunda Especialidad': {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        'Segunda Especialidad': [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Segunda Especialidad en Educación Básica Alternativa',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Segunda Especialidad en Educación Especial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Segunda Especialidad en Educación Física',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Segunda Especialidad en Educación Inicial',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Segunda Especialidad en Gestión Pública en Educación',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            'Segunda Especialidad en Inteligencia Artificial e Informática Educativa',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     }
 
 
-# ============================================================
-# INICIALIZACIÓN
+
+
+
+
+
+
+
+
+
+
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _tipo_programa(nombre, nivel):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if nivel == 'Pregrado': return 'Pregrado'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if nombre.startswith('Doctorado'): return 'Doctorado'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if nombre.startswith('Maestría'): return 'Maestría'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return 'Segunda Especialidad'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_base_datos():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    con = conectar(); cur = con.cursor()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ddl = '''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS niveles_academicos(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, nombre TEXT UNIQUE NOT NULL, activo INTEGER DEFAULT 1);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS unidades_academicas(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, nivel_id INTEGER NOT NULL, nombre TEXT NOT NULL,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      activo INTEGER DEFAULT 1, UNIQUE(nivel_id,nombre), FOREIGN KEY(nivel_id) REFERENCES niveles_academicos(id));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS programas_academicos(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, unidad_id INTEGER NOT NULL, nombre TEXT NOT NULL,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      tipo_programa TEXT NOT NULL, activo INTEGER DEFAULT 1, UNIQUE(unidad_id,nombre),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FOREIGN KEY(unidad_id) REFERENCES unidades_academicas(id));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS usuarios(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, nombre_completo TEXT NOT NULL, dni TEXT UNIQUE NOT NULL,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      password_hash TEXT NOT NULL, rol TEXT DEFAULT 'usuario', nivel_id INTEGER, unidad_id INTEGER,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      programa_id INTEGER, estado TEXT DEFAULT 'activo', fecha_registro TEXT, ultimo_acceso TEXT,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FOREIGN KEY(nivel_id) REFERENCES niveles_academicos(id),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FOREIGN KEY(unidad_id) REFERENCES unidades_academicas(id),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FOREIGN KEY(programa_id) REFERENCES programas_academicos(id));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS pagos_voucher(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, codigo TEXT UNIQUE, usuario_id INTEGER NOT NULL,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      nivel_id INTEGER, unidad_id INTEGER, programa_id INTEGER,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      tipo_registro TEXT NOT NULL, concepto TEXT NOT NULL, cuota TEXT, monto REAL NOT NULL,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fecha_pago TEXT NOT NULL, canal_pago TEXT NOT NULL, medio_pago TEXT,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      numero_operacion TEXT, archivo TEXT NOT NULL, nombre_original TEXT, observacion TEXT,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      estado TEXT DEFAULT 'Pendiente', observacion_admin TEXT, revisado_por INTEGER,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fecha_registro TEXT, fecha_actualizacion TEXT,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FOREIGN KEY(usuario_id) REFERENCES usuarios(id), FOREIGN KEY(revisado_por) REFERENCES usuarios(id));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS comunicados(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, titulo TEXT NOT NULL, contenido TEXT NOT NULL,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fecha_publicacion TEXT, activo INTEGER DEFAULT 1, creado_por INTEGER);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS fuentes_conocimiento(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, titulo TEXT NOT NULL, descripcion TEXT, categoria TEXT,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      tipo_fuente TEXT DEFAULT 'documento', archivo TEXT, nombre_original TEXT,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      nivel_id INTEGER, unidad_id INTEGER, programa_id INTEGER, creado_por INTEGER,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fecha_creacion TEXT, fecha_actualizacion TEXT, activo INTEGER DEFAULT 1, procesado INTEGER DEFAULT 0);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS fragmentos_conocimiento(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, fuente_id INTEGER NOT NULL, numero_fragmento INTEGER DEFAULT 0,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      contenido TEXT NOT NULL, metadata TEXT, activo INTEGER DEFAULT 1,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FOREIGN KEY(fuente_id) REFERENCES fuentes_conocimiento(id) ON DELETE CASCADE);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS conversaciones_ia(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, usuario_id INTEGER, canal TEXT DEFAULT 'web',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fecha_inicio TEXT, fecha_ultima_interaccion TEXT, activo INTEGER DEFAULT 1);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS mensajes_ia(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, conversacion_id INTEGER NOT NULL, usuario_id INTEGER,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      rol TEXT NOT NULL, contenido TEXT NOT NULL, fuentes TEXT, fecha TEXT);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS consultas_ia(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, usuario_id INTEGER, conversacion_id INTEGER,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      pregunta TEXT NOT NULL, respuesta TEXT, respondida INTEGER DEFAULT 0, confianza REAL DEFAULT 0,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fuentes TEXT, canal TEXT DEFAULT 'web', fecha TEXT);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS preguntas_frecuentes(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, pregunta TEXT NOT NULL, respuesta TEXT, categoria TEXT DEFAULT 'General',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      icono TEXT DEFAULT '💬', orden INTEGER DEFAULT 0, activo INTEGER DEFAULT 1,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      creado_por INTEGER, fecha_creacion TEXT, fecha_actualizacion TEXT);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS auditoria(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY, usuario_id INTEGER, accion TEXT, modulo TEXT, detalle TEXT, fecha TEXT);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS postulantes_docentes(
+
+
+
+
+
+
+
+      id SERIAL PRIMARY KEY,dni TEXT UNIQUE NOT NULL,nombres TEXT NOT NULL,apellidos TEXT NOT NULL,correo TEXT UNIQUE NOT NULL,telefono TEXT,password_hash TEXT NOT NULL,ciudad TEXT,profesion TEXT,grado_academico TEXT,especialidad TEXT,areas_interes TEXT,disponibilidad TEXT,modalidad TEXT,resumen_profesional TEXT,cv_archivo TEXT,cv_nombre_original TEXT,estado TEXT DEFAULT 'Borrador',observacion_admin TEXT,fecha_registro TEXT,fecha_envio TEXT,fecha_actualizacion TEXT,activo INTEGER DEFAULT 1);
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS postulante_historial_estado(id SERIAL PRIMARY KEY,postulante_id INTEGER NOT NULL,estado TEXT NOT NULL,observacion TEXT,cambiado_por INTEGER,fecha TEXT);
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS convocatorias_docentes(
+
+
+
+      id SERIAL PRIMARY KEY, codigo TEXT UNIQUE, titulo TEXT NOT NULL, descripcion TEXT,
+
+
+
+      nivel_id INTEGER, unidad_id INTEGER, programa_id INTEGER, area_curso TEXT, profesion_requerida TEXT,
+
+
+
+      grado_minimo TEXT, experiencia_requerida TEXT, modalidad TEXT, vacantes INTEGER DEFAULT 1,
+
+
+
+      fecha_inicio TEXT, fecha_limite TEXT, bases_archivo TEXT, bases_nombre_original TEXT,
+
+
+
+      estado TEXT DEFAULT 'Borrador', creado_por INTEGER, fecha_creacion TEXT, fecha_actualizacion TEXT);
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS postulaciones_convocatorias(
+
+
+
+      id SERIAL PRIMARY KEY, convocatoria_id INTEGER NOT NULL, postulante_id INTEGER NOT NULL,
+
+
+
+      estado TEXT DEFAULT 'Recibido', observacion_admin TEXT, fecha_postulacion TEXT, fecha_actualizacion TEXT,
+
+
+
+      revisado_por INTEGER, UNIQUE(convocatoria_id,postulante_id));
+
+
+
+
+
+
+
+    CREATE TABLE IF NOT EXISTS postulacion_historial_estado(
+
+
+
+      id SERIAL PRIMARY KEY, postulacion_id INTEGER NOT NULL, estado TEXT NOT NULL,
+
+
+
+      observacion TEXT, cambiado_por INTEGER, fecha TEXT);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    '''
+
+    for statement in ddl.split(';'):
+
+        if statement.strip():
+
+            cur.execute(_sql(statement))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Migraciones seguras para bases creadas con versiones anteriores.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # CREATE TABLE IF NOT EXISTS no agrega columnas a una tabla que ya existe,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # por eso verificamos y añadimos cada columna faltante antes de insertar datos.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    for col, definition in [('nivel_id','INTEGER'),('unidad_id','INTEGER'),('programa_id','INTEGER')]:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        _asegurar_columna(con, 'usuarios', col, definition)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        _asegurar_columna(con, 'fuentes_conocimiento', col, definition)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Compatibilidad con versiones antiguas de preguntas_frecuentes.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    for col, definition in [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('categoria', "TEXT DEFAULT 'General'"),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('icono', "TEXT DEFAULT '💬'"),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('orden', 'INTEGER DEFAULT 0'),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('activo', 'INTEGER DEFAULT 1'),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('creado_por', 'INTEGER'),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('fecha_creacion', 'TEXT'),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('fecha_actualizacion', 'TEXT'),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ]:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        _asegurar_columna(con, 'preguntas_frecuentes', col, definition)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Normaliza registros antiguos para que la interfaz pueda usarlos inmediatamente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("UPDATE preguntas_frecuentes SET categoria='General' WHERE categoria IS NULL OR TRIM(categoria)=''")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("UPDATE preguntas_frecuentes SET icono='💬' WHERE icono IS NULL OR TRIM(icono)=''")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("UPDATE preguntas_frecuentes SET orden=id*10 WHERE orden IS NULL OR orden=0")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("UPDATE preguntas_frecuentes SET activo=1 WHERE activo IS NULL")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("UPDATE preguntas_frecuentes SET fecha_creacion=%s WHERE fecha_creacion IS NULL OR TRIM(fecha_creacion)=''", (ahora(),))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("UPDATE preguntas_frecuentes SET fecha_actualizacion=%s WHERE fecha_actualizacion IS NULL OR TRIM(fecha_actualizacion)=''", (ahora(),))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    con.commit()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Estructura académica oficial cargada idempotentemente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    for nivel, unidades in ESTRUCTURA.items():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        cur.execute('INSERT INTO niveles_academicos(nombre) VALUES(%s) ON CONFLICT (nombre) DO NOTHING',(nivel,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        cur.execute('SELECT id FROM niveles_academicos WHERE nombre=%s',(nivel,)); nivel_id = cur.fetchone()['id']
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        for unidad, programas in unidades.items():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            cur.execute('INSERT INTO unidades_academicas(nivel_id,nombre) VALUES(%s,%s) ON CONFLICT (nivel_id,nombre) DO NOTHING',(nivel_id,unidad))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            cur.execute('SELECT id FROM unidades_academicas WHERE nivel_id=%s AND nombre=%s',(nivel_id,unidad)); unidad_id = cur.fetchone()['id']
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            for programa in programas:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                cur.execute('INSERT INTO programas_academicos(unidad_id,nombre,tipo_programa) VALUES(%s,%s,%s) ON CONFLICT (unidad_id,nombre) DO NOTHING',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                            (unidad_id,programa,_tipo_programa(programa,nivel)))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Preguntas frecuentes iniciales. Son accesos rápidos; la respuesta siempre la genera UPRI con RAG.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    faqs_iniciales = [
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Cómo registro mi voucher de pago?','Pagos','💳',10),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Qué hago si realicé un pago y todavía aparece como deuda?','Pagos','⚠️',20),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Cómo realizo una convalidación?','Trámites','🔄',30),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Cómo ingreso a Moodle o a la plataforma virtual?','Plataformas','💻',40),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Cómo solicito una constancia o certificado?','Documentos','📄',50),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Cuáles son los requisitos para bachiller y título?','Grados y títulos','🎓',60),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Cuáles son las fechas o plazos importantes?','Fechas','📅',70),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ('¿Con qué área debo comunicarme según mi consulta?','Orientación','🏢',80),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute('SELECT COUNT(*) n FROM preguntas_frecuentes')
+
+    if cur.fetchone()['n'] == 0:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # Algunas versiones antiguas tenían una columna \\\\\\\\`respuesta\\\\\\\\` NOT NULL.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # Aunque UPRI ya no usa respuestas fijas (responde con RAG), la rellenamos
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # con texto vacío para conservar compatibilidad sin borrar la base existente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        columnas_faq = {c: True for c in _columnas(con, 'preguntas_frecuentes')}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        if 'respuesta' in columnas_faq:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            cur.executemany('''INSERT INTO preguntas_frecuentes(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                   pregunta,respuesta,categoria,icono,orden,activo,fecha_creacion,fecha_actualizacion
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                               ) VALUES(%s,%s,%s,%s,%s,1,%s,%s)''',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                            [(q,'',c,i,o,ahora(),ahora()) for q,c,i,o in faqs_iniciales])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        else:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            cur.executemany('''INSERT INTO preguntas_frecuentes(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                   pregunta,categoria,icono,orden,activo,fecha_creacion,fecha_actualizacion
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                               ) VALUES(%s,%s,%s,%s,1,%s,%s)''',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                            [(q,c,i,o,ahora(),ahora()) for q,c,i,o in faqs_iniciales])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Admin por defecto solo si no existe.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    cur.execute("SELECT 1 FROM usuarios WHERE dni='admin'")
+
+    if not cur.fetchone():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        cur.execute('INSERT INTO usuarios(nombre_completo,dni,password_hash,rol,estado,fecha_registro) VALUES(%s,%s,%s,%s,%s,%s)',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    ('Administrador UPRIT','admin',generar_hash('Admin123*'),'administrador','activo',ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    con.commit(); con.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_niveles(): return filas('SELECT * FROM niveles_academicos WHERE activo=1 ORDER BY id')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_unidades(nivel_id): return filas('SELECT * FROM unidades_academicas WHERE activo=1 AND nivel_id=%s ORDER BY nombre',(nivel_id,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_programas(unidad_id): return filas('SELECT * FROM programas_academicos WHERE activo=1 AND unidad_id=%s ORDER BY tipo_programa,nombre',(unidad_id,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_programa(programa_id):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return fila('''SELECT p.*,u.nombre unidad_nombre,n.nombre nivel_nombre,u.nivel_id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   FROM programas_academicos p JOIN unidades_academicas u ON p.unidad_id=u.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   JOIN niveles_academicos n ON u.nivel_id=n.id WHERE p.id=%s''',(programa_id,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_usuario(nombre,dni,password,nivel_id,unidad_id,programa_id):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    try:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        ejecutar('''INSERT INTO usuarios(nombre_completo,dni,password_hash,rol,nivel_id,unidad_id,programa_id,estado,fecha_registro)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)''',(nombre.strip(),dni.strip(),generar_hash(password),'usuario',nivel_id,unidad_id,programa_id,'activo',ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        return True,'Cuenta creada correctamente.'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    except psycopg2.IntegrityError:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        return False,'El DNI/usuario ya se encuentra registrado.'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def autenticar_usuario(dni,password):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    u=fila('''SELECT u.*,n.nombre nivel_nombre,ua.nombre unidad_nombre,p.nombre programa_nombre
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              FROM usuarios u LEFT JOIN niveles_academicos n ON u.nivel_id=n.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              LEFT JOIN unidades_academicas ua ON u.unidad_id=ua.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              LEFT JOIN programas_academicos p ON u.programa_id=p.id WHERE u.dni=%s''',(dni.strip(),))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if not u or u['estado']!='activo' or not verificar_password(password,u['password_hash']): return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE usuarios SET ultimo_acceso=%s WHERE id=%s',(ahora(),u['id']))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return fila('''SELECT u.*,n.nombre nivel_nombre,ua.nombre unidad_nombre,p.nombre programa_nombre
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              FROM usuarios u LEFT JOIN niveles_academicos n ON u.nivel_id=n.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              LEFT JOIN unidades_academicas ua ON u.unidad_id=ua.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              LEFT JOIN programas_academicos p ON u.programa_id=p.id WHERE u.id=%s''',(u['id'],))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def actualizar_datos_academicos(usuario_id,nivel_id,unidad_id,programa_id):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Valida que la unidad pertenezca al nivel y el programa a la unidad.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    valido=fila('''SELECT p.id FROM programas_academicos p
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    JOIN unidades_academicas ua ON p.unidad_id=ua.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    WHERE p.id=%s AND p.unidad_id=%s AND ua.nivel_id=%s AND p.activo=1 AND ua.activo=1''',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                 (programa_id,unidad_id,nivel_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if not valido:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        return False,'La combinación académica seleccionada no es válida.'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE usuarios SET nivel_id=%s,unidad_id=%s,programa_id=%s WHERE id=%s',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+             (nivel_id,unidad_id,programa_id,usuario_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    registrar_auditoria(usuario_id,'Actualizar','Datos académicos',f'Nivel {nivel_id} · Unidad {unidad_id} · Programa {programa_id}')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return True,'Datos académicos guardados correctamente.'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_usuario(usuario_id):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return fila('''SELECT u.*,n.nombre nivel_nombre,ua.nombre unidad_nombre,p.nombre programa_nombre
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   FROM usuarios u LEFT JOIN niveles_academicos n ON u.nivel_id=n.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   LEFT JOIN unidades_academicas ua ON u.unidad_id=ua.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   LEFT JOIN programas_academicos p ON u.programa_id=p.id WHERE u.id=%s''',(usuario_id,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_usuarios():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas('''SELECT u.*,n.nombre nivel_nombre,ua.nombre unidad_nombre,p.nombre programa_nombre
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FROM usuarios u LEFT JOIN niveles_academicos n ON u.nivel_id=n.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      LEFT JOIN unidades_academicas ua ON u.unidad_id=ua.id LEFT JOIN programas_academicos p ON u.programa_id=p.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      ORDER BY u.nombre_completo''')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def cambiar_estado_usuario(id_,estado,admin_id=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE usuarios SET estado=%s WHERE id=%s',(estado,id_)); registrar_auditoria(admin_id,'Cambiar estado','Usuarios',f'{id_}: {estado}')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def registrar_auditoria(usuario_id,accion,modulo,detalle=''):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('INSERT INTO auditoria(usuario_id,accion,modulo,detalle,fecha) VALUES(%s,%s,%s,%s,%s)',(usuario_id,accion,modulo,detalle,ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_auditoria(limite=300):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas('''SELECT a.*,u.nombre_completo usuario_nombre FROM auditoria a LEFT JOIN usuarios u ON a.usuario_id=u.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   ORDER BY a.id DESC LIMIT %s''',(limite,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_pago(usuario_id,tipo_registro,concepto,cuota,monto,fecha_pago,canal_pago,medio_pago,numero_operacion,archivo,nombre_original,observacion=''):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    u=fila('SELECT * FROM usuarios WHERE id=%s',(usuario_id,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if not u: return False,'Usuario no encontrado.',None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    id_=ejecutar('''INSERT INTO pagos_voucher(usuario_id,nivel_id,unidad_id,programa_id,tipo_registro,concepto,cuota,monto,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        fecha_pago,canal_pago,medio_pago,numero_operacion,archivo,nombre_original,observacion,estado,fecha_registro,fecha_actualizacion)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        (usuario_id,u.get('nivel_id'),u.get('unidad_id'),u.get('programa_id'),tipo_registro,concepto,cuota,float(monto),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+         fecha_pago,canal_pago,medio_pago,numero_operacion,archivo,nombre_original,observacion,'Pendiente',ahora(),ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    codigo=f'PAGO-{datetime.now().year}-{id_:06d}'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE pagos_voucher SET codigo=%s WHERE id=%s',(codigo,id_))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    registrar_auditoria(usuario_id,'Registrar','Pagos',codigo)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return True,'Voucher registrado correctamente.',codigo
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_pagos(usuario_id=None, filtros=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    sql='''SELECT pv.*,u.nombre_completo,u.dni,n.nombre nivel_nombre,ua.nombre unidad_nombre,p.nombre programa_nombre,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                  r.nombre_completo revisor_nombre
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+           FROM pagos_voucher pv JOIN usuarios u ON pv.usuario_id=u.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+           LEFT JOIN niveles_academicos n ON pv.nivel_id=n.id LEFT JOIN unidades_academicas ua ON pv.unidad_id=ua.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+           LEFT JOIN programas_academicos p ON pv.programa_id=p.id LEFT JOIN usuarios r ON pv.revisado_por=r.id WHERE 1=1'''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    params=[]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if usuario_id is not None: sql+=' AND pv.usuario_id=%s'; params.append(usuario_id)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    filtros=filtros or {}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    for campo in ['nivel_id','unidad_id','programa_id','tipo_registro','canal_pago','estado','concepto']:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        if filtros.get(campo) not in (None,'','Todos'):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            sql+=f' AND pv.{campo}=%s'; params.append(filtros[campo])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if filtros.get('desde'): sql+=' AND date(pv.fecha_pago)>=date(%s)'; params.append(filtros['desde'])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if filtros.get('hasta'): sql+=' AND date(pv.fecha_pago)<=date(%s)'; params.append(filtros['hasta'])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    sql+=' ORDER BY pv.id DESC'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas(sql,tuple(params))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def actualizar_estado_pago(pago_id,estado,observacion_admin,admin_id):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('''UPDATE pagos_voucher SET estado=%s,observacion_admin=%s,revisado_por=%s,fecha_actualizacion=%s WHERE id=%s''',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+             (estado,observacion_admin,admin_id,ahora(),pago_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    registrar_auditoria(admin_id,'Actualizar estado','Pagos',f'Pago #{pago_id}: {estado}')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def metricas_pagos():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    total=fila('SELECT COUNT(*) n,COALESCE(SUM(monto),0) monto FROM pagos_voucher')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    pend=fila("SELECT COUNT(*) n FROM pagos_voucher WHERE estado='Pendiente'")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    incid=fila("SELECT COUNT(*) n FROM pagos_voucher WHERE tipo_registro='Pago no actualizado'")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    val=fila("SELECT COUNT(*) n FROM pagos_voucher WHERE estado IN ('Actualizado','Validado')")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return {'total':total['n'],'monto':total['monto'],'pendientes':pend['n'],'incidencias':incid['n'],'validados':val['n']}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_comunicado(titulo,contenido,usuario_id):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('INSERT INTO comunicados(titulo,contenido,fecha_publicacion,activo,creado_por) VALUES(%s,%s,%s,%s,%s)',(titulo,contenido,ahora(),1,usuario_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_comunicados(admin=False):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas('SELECT * FROM comunicados '+('' if admin else 'WHERE activo=1 ')+'ORDER BY id DESC')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def cambiar_estado_comunicado(id_,activo): ejecutar('UPDATE comunicados SET activo=%s WHERE id=%s',(activo,id_))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------- Base de conocimiento ----------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_fuente_conocimiento(titulo,descripcion='',categoria='General',tipo_fuente='documento',archivo=None,nombre_original=None,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                              nivel_id=None,unidad_id=None,programa_id=None,creado_por=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if not titulo.strip(): return False,'El título es obligatorio.',None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    id_=ejecutar('''INSERT INTO fuentes_conocimiento(titulo,descripcion,categoria,tipo_fuente,archivo,nombre_original,nivel_id,unidad_id,programa_id,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                  creado_por,fecha_creacion,fecha_actualizacion,activo,procesado) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,0)''',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                 (titulo.strip(),descripcion.strip(),categoria,tipo_fuente,archivo,nombre_original,nivel_id,unidad_id,programa_id,creado_por,ahora(),ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return True,'Fuente registrada correctamente.',id_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def guardar_fragmentos_conocimiento(fuente_id,fragmentos):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    validos=[x for x in fragmentos if (x.get('contenido') or '').strip()]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if not validos: raise ValueError('No se generaron fragmentos válidos.')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    with conectar() as con:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        _execute(con, 'DELETE FROM fragmentos_conocimiento WHERE fuente_id=%s',(fuente_id,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        for i,x in enumerate(validos,1):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            _execute(con, 'INSERT INTO fragmentos_conocimiento(fuente_id,numero_fragmento,contenido,metadata,activo) VALUES(%s,%s,%s,%s,1)',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                        (fuente_id,i,x['contenido'].strip(),x.get('metadata','')))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        _execute(con, 'UPDATE fuentes_conocimiento SET procesado=1,fecha_actualizacion=%s WHERE id=%s',(ahora(),fuente_id)); con.commit()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def marcar_fuente_procesada(fuente_id,procesado=1): ejecutar('UPDATE fuentes_conocimiento SET procesado=%s,fecha_actualizacion=%s WHERE id=%s',(procesado,ahora(),fuente_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_fuentes_conocimiento(admin=False):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas('''SELECT fc.*,n.nombre nivel_nombre,u.nombre unidad_nombre,p.nombre programa_nombre,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      (SELECT COUNT(*) FROM fragmentos_conocimiento fr WHERE fr.fuente_id=fc.id AND fr.activo=1) fragmentos
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      FROM fuentes_conocimiento fc LEFT JOIN niveles_academicos n ON fc.nivel_id=n.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      LEFT JOIN unidades_academicas u ON fc.unidad_id=u.id LEFT JOIN programas_academicos p ON fc.programa_id=p.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      '''+('' if admin else 'WHERE fc.activo=1 AND fc.procesado=1 ')+'''ORDER BY fc.id DESC''')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def cambiar_estado_fuente_conocimiento(id_,activo,usuario_id=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE fuentes_conocimiento SET activo=%s,fecha_actualizacion=%s WHERE id=%s',(activo,ahora(),id_)); registrar_auditoria(usuario_id,'Cambiar estado','Base de conocimiento',str(id_))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def eliminar_fuente_conocimiento(id_,usuario_id=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    f=fila('SELECT archivo FROM fuentes_conocimiento WHERE id=%s',(id_,)); ejecutar('DELETE FROM fragmentos_conocimiento WHERE fuente_id=%s',(id_,)); ejecutar('DELETE FROM fuentes_conocimiento WHERE id=%s',(id_,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if f and f.get('archivo') and os.path.exists(f['archivo']):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        try: os.remove(f['archivo'])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        except OSError: pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    registrar_auditoria(usuario_id,'Eliminar','Base de conocimiento',str(id_))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_fragmentos_conocimiento(nivel_id=None,unidad_id=None,programa_id=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Fuente general (NULL) o dirigida al perfil del alumno.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas('''SELECT fr.*,fc.titulo fuente_titulo,fc.categoria fuente_categoria,fc.nombre_original,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      fc.nivel_id,fc.unidad_id,fc.programa_id FROM fragmentos_conocimiento fr
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      JOIN fuentes_conocimiento fc ON fr.fuente_id=fc.id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      WHERE fr.activo=1 AND fc.activo=1 AND fc.procesado=1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      AND (fc.nivel_id IS NULL OR fc.nivel_id=%s)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      AND (fc.unidad_id IS NULL OR fc.unidad_id=%s)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      AND (fc.programa_id IS NULL OR fc.programa_id=%s)''',(nivel_id,unidad_id,programa_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------- IA ----------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_conversacion_ia(usuario_id=None,canal='web'):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return ejecutar('INSERT INTO conversaciones_ia(usuario_id,canal,fecha_inicio,fecha_ultima_interaccion,activo) VALUES(%s,%s,%s,%s,1)',(usuario_id,canal,ahora(),ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def guardar_mensaje_ia(conversacion_id,rol,contenido,usuario_id=None,fuentes=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    import json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('INSERT INTO mensajes_ia(conversacion_id,usuario_id,rol,contenido,fuentes,fecha) VALUES(%s,%s,%s,%s,%s,%s)',(conversacion_id,usuario_id,rol,contenido,json.dumps(fuentes or [],ensure_ascii=False),ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE conversaciones_ia SET fecha_ultima_interaccion=%s WHERE id=%s',(ahora(),conversacion_id))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_mensajes_ia(conversacion_id,limite=8):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas('SELECT * FROM (SELECT * FROM mensajes_ia WHERE conversacion_id=%s ORDER BY id DESC LIMIT %s) ORDER BY id',(conversacion_id,limite))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def registrar_consulta_ia(usuario_id,conversacion_id,pregunta,respuesta,respondida,confianza,fuentes,canal='web'):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    import json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return ejecutar('''INSERT INTO consultas_ia(usuario_id,conversacion_id,pregunta,respuesta,respondida,confianza,fuentes,canal,fecha)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)''',(usuario_id,conversacion_id,pregunta,respuesta,1 if respondida else 0,float(confianza),json.dumps(fuentes or [],ensure_ascii=False),canal,ahora()))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_consultas_ia(limite=500,solo_sin_respuesta=False):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    sql='''SELECT c.*,u.nombre_completo,u.dni FROM consultas_ia c LEFT JOIN usuarios u ON c.usuario_id=u.id'''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if solo_sin_respuesta: sql+=' WHERE c.respondida=0'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    sql+=' ORDER BY c.id DESC LIMIT %s'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas(sql,(limite,))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def estadisticas_ia():
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    t=fila('SELECT COUNT(*) n FROM consultas_ia')['n']; s=fila('SELECT COUNT(*) n FROM consultas_ia WHERE respondida=0')['n']
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return {'consultas':t,'sin_respuesta':s,'respondidas':t-s}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ============================================================
 
-if __name__ == "__main__":
-    crear_base_datos()
 
-    print("======================================")
-    print("UPRIT CONECTA")
-    print("======================================")
-    print("Base de datos preparada.")
-    print("Administrador: admin")
-    print("Contraseña: Admin123*")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PREGUNTAS FRECUENTES UPRI
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def obtener_preguntas_frecuentes(admin=False):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    sql='SELECT * FROM preguntas_frecuentes'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if not admin: sql+=' WHERE activo=1'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    sql+=' ORDER BY orden ASC, id ASC'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    return filas(sql)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crear_pregunta_frecuente(pregunta,categoria='General',icono='💬',orden=0,admin_id=None,respuesta=''):
+    id_=ejecutar('''INSERT INTO preguntas_frecuentes(
+                        pregunta,respuesta,categoria,icono,orden,activo,creado_por,fecha_creacion,fecha_actualizacion
+                    ) VALUES(%s,%s,%s,%s,%s,1,%s,%s,%s) RETURNING id''',
+                 (pregunta.strip(),respuesta.strip(),categoria.strip() or 'General',icono.strip() or '💬',int(orden),admin_id,ahora(),ahora()))
+    registrar_auditoria(admin_id,'Crear','Preguntas frecuentes',f'FAQ #{id_}: {pregunta[:100]}')
+    return id_
+
+
+def actualizar_pregunta_frecuente(id_,pregunta,categoria,icono,orden,admin_id=None,respuesta=''):
+    ejecutar('''UPDATE preguntas_frecuentes SET pregunta=%s,respuesta=%s,categoria=%s,icono=%s,orden=%s,fecha_actualizacion=%s WHERE id=%s''',
+             (pregunta.strip(),respuesta.strip(),categoria.strip() or 'General',icono.strip() or '💬',int(orden),ahora(),id_))
+    registrar_auditoria(admin_id,'Editar','Preguntas frecuentes',f'FAQ #{id_}')
+
+
+def cambiar_estado_pregunta_frecuente(id_,activo,admin_id=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('UPDATE preguntas_frecuentes SET activo=%s,fecha_actualizacion=%s WHERE id=%s',(int(activo),ahora(),id_))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    registrar_auditoria(admin_id,'Activar' if activo else 'Desactivar','Preguntas frecuentes',f'FAQ #{id_}')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def eliminar_pregunta_frecuente(id_,admin_id=None):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ejecutar('DELETE FROM preguntas_frecuentes WHERE id=%s',(id_,))
+
+
+
+
+
+
+
+ESTADOS_POSTULACION=['Borrador','Recibido','En revisión','Observado','Apto','Entrevista','Seleccionado','No seleccionado']
+
+
+
+
+
+
+
+def crear_postulante(dni,nombres,apellidos,correo,telefono,password):
+
+
+
+
+
+
+
+    try:
+
+
+
+
+
+
+
+        i=ejecutar("INSERT INTO postulantes_docentes(dni,nombres,apellidos,correo,telefono,password_hash,estado,fecha_registro,fecha_actualizacion) VALUES(%s,%s,%s,%s,%s,%s,'Borrador',%s,%s)",(dni.strip(),nombres.strip(),apellidos.strip(),correo.strip().lower(),telefono.strip(),generar_hash(password),ahora(),ahora()))
+
+
+
+
+
+
+
+        ejecutar("INSERT INTO postulante_historial_estado(postulante_id,estado,observacion,fecha) VALUES(%s,%s,%s,%s)",(i,'Borrador','Perfil creado.',ahora())); return True,'Perfil creado.',i
+
+
+
+
+
+
+
+    except psycopg2.IntegrityError: return False,'DNI o correo ya registrado.',None
+
+
+
+
+
+
+
+def autenticar_postulante(u,pw):
+
+
+
+
+
+
+
+    p=fila("SELECT * FROM postulantes_docentes WHERE activo=1 AND (dni=%s OR lower(correo)=lower(%s))",(u.strip(),u.strip())); return p if p and verificar_password(pw,p['password_hash']) else None
+
+
+
+
+
+
+
+def obtener_postulante(i): return fila('SELECT * FROM postulantes_docentes WHERE id=%s',(i,))
+
+
+
+
+
+
+
+def actualizar_perfil_postulante(i,telefono,ciudad,profesion,grado,especialidad,areas,disponibilidad,modalidad,resumen):
+
+
+
+
+
+
+
+    ejecutar('UPDATE postulantes_docentes SET telefono=%s,ciudad=%s,profesion=%s,grado_academico=%s,especialidad=%s,areas_interes=%s,disponibilidad=%s,modalidad=%s,resumen_profesional=%s,fecha_actualizacion=%s WHERE id=%s',(telefono,ciudad,profesion,grado,especialidad,areas,disponibilidad,modalidad,resumen,ahora(),i))
+
+
+
+
+
+
+
+def guardar_cv_postulante(i,ruta,nombre): ejecutar('UPDATE postulantes_docentes SET cv_archivo=%s,cv_nombre_original=%s,fecha_actualizacion=%s WHERE id=%s',(ruta,nombre,ahora(),i))
+
+
+
+
+
+
+
+def enviar_postulacion(i):
+
+
+
+
+
+
+
+    p=obtener_postulante(i); falt=[e for c,e in [('profesion','profesión'),('grado_academico','grado académico'),('especialidad','especialidad'),('disponibilidad','disponibilidad'),('cv_archivo','CV')] if not p.get(c)]
+
+
+
+
+
+
+
+    if falt:return False,'Completa: '+', '.join(falt)
+
+
+
+
+
+
+
+    ejecutar("UPDATE postulantes_docentes SET estado='Recibido',fecha_envio=%s,fecha_actualizacion=%s WHERE id=%s",(ahora(),ahora(),i)); ejecutar('INSERT INTO postulante_historial_estado(postulante_id,estado,observacion,fecha) VALUES(%s,%s,%s,%s)',(i,'Recibido','Postulación enviada.',ahora())); return True,'Postulación enviada.'
+
+
+
+
+
+
+
+def obtener_postulantes(estado=None):
+
+
+
+
+
+
+
+    return filas('SELECT * FROM postulantes_docentes WHERE activo=1'+(' AND estado=%s' if estado and estado!='Todos' else '')+' ORDER BY id DESC',((estado,) if estado and estado!='Todos' else ()))
+
+
+
+
+
+
+
+def actualizar_estado_postulante(i,estado,obs='',admin_id=None):
+
+
+
+
+
+
+
+    ejecutar('UPDATE postulantes_docentes SET estado=%s,observacion_admin=%s,fecha_actualizacion=%s WHERE id=%s',(estado,obs,ahora(),i)); ejecutar('INSERT INTO postulante_historial_estado(postulante_id,estado,observacion,cambiado_por,fecha) VALUES(%s,%s,%s,%s,%s)',(i,estado,obs,admin_id,ahora())); return True,'Estado actualizado.'
+
+
+
+
+
+
+
+def obtener_historial_postulante(i): return filas('SELECT * FROM postulante_historial_estado WHERE postulante_id=%s ORDER BY id DESC',(i,))
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+
+
+
+# CONVOCATORIAS DOCENTES
+
+
+
+# ============================================================
+
+
+
+ESTADOS_CONVOCATORIA=['Borrador','Publicada','Cerrada','Cancelada']
+
+
+
+
+
+
+
+def crear_convocatoria_docente(titulo,descripcion='',nivel_id=None,unidad_id=None,programa_id=None,area_curso='',profesion_requerida='',grado_minimo='',experiencia_requerida='',modalidad='',vacantes=1,fecha_inicio='',fecha_limite='',bases_archivo=None,bases_nombre_original=None,admin_id=None):
+
+
+
+    if not (titulo or '').strip(): return False,'El título es obligatorio.',None
+
+
+
+    try: vacantes=max(1,int(vacantes or 1))
+
+
+
+    except Exception: vacantes=1
+
+
+
+    i=ejecutar("""INSERT INTO convocatorias_docentes(titulo,descripcion,nivel_id,unidad_id,programa_id,area_curso,profesion_requerida,grado_minimo,experiencia_requerida,modalidad,vacantes,fecha_inicio,fecha_limite,bases_archivo,bases_nombre_original,estado,creado_por,fecha_creacion,fecha_actualizacion)
+
+
+
+                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",(titulo.strip(),descripcion.strip(),nivel_id,unidad_id,programa_id,area_curso.strip(),profesion_requerida.strip(),grado_minimo.strip(),experiencia_requerida.strip(),modalidad.strip(),vacantes,fecha_inicio or None,fecha_limite or None,bases_archivo,bases_nombre_original,'Borrador',admin_id,ahora(),ahora()))
+
+
+
+    codigo=f'CONV-{datetime.now().year}-{i:04d}'
+
+
+
+    ejecutar('UPDATE convocatorias_docentes SET codigo=%s WHERE id=%s',(codigo,i))
+
+
+
+    registrar_auditoria(admin_id,'Crear','Convocatorias docentes',codigo)
+
+
+
+    return True,'Convocatoria creada correctamente.',i
+
+
+
+
+
+
+
+def obtener_convocatoria_docente(i):
+
+
+
+    return fila("""SELECT c.*,n.nombre nivel_nombre,u.nombre unidad_nombre,p.nombre programa_nombre,
+
+
+
+      (SELECT COUNT(*) FROM postulaciones_convocatorias pc WHERE pc.convocatoria_id=c.id) total_postulantes
+
+
+
+      FROM convocatorias_docentes c LEFT JOIN niveles_academicos n ON c.nivel_id=n.id
+
+
+
+      LEFT JOIN unidades_academicas u ON c.unidad_id=u.id LEFT JOIN programas_academicos p ON c.programa_id=p.id
+
+
+
+      WHERE c.id=%s""",(i,))
+
+
+
+
+
+
+
+def obtener_convocatorias_docentes(estado=None,solo_vigentes=False):
+
+
+
+    sql="""SELECT c.*,n.nombre nivel_nombre,u.nombre unidad_nombre,p.nombre programa_nombre,
+
+
+
+      (SELECT COUNT(*) FROM postulaciones_convocatorias pc WHERE pc.convocatoria_id=c.id) total_postulantes
+
+
+
+      FROM convocatorias_docentes c LEFT JOIN niveles_academicos n ON c.nivel_id=n.id
+
+
+
+      LEFT JOIN unidades_academicas u ON c.unidad_id=u.id LEFT JOIN programas_academicos p ON c.programa_id=p.id WHERE 1=1"""
+
+
+
+    par=[]
+
+
+
+    if estado and estado!='Todos': sql+=' AND c.estado=%s'; par.append(estado)
+
+
+
+    if solo_vigentes: sql+=" AND c.estado='Publicada' AND (c.fecha_inicio IS NULL OR date(c.fecha_inicio)<=CURRENT_DATE) AND (c.fecha_limite IS NULL OR date(c.fecha_limite)>=CURRENT_DATE)"
+
+
+
+    return filas(sql+' ORDER BY c.id DESC',tuple(par))
+
+
+
+
+
+
+
+def cambiar_estado_convocatoria(i,estado,admin_id=None):
+
+
+
+    if estado not in ESTADOS_CONVOCATORIA: return False,'Estado no válido.'
+
+
+
+    ejecutar('UPDATE convocatorias_docentes SET estado=%s,fecha_actualizacion=%s WHERE id=%s',(estado,ahora(),i))
+
+
+
+    registrar_auditoria(admin_id,'Cambiar estado','Convocatorias docentes',f'#{i}: {estado}')
+
+
+
+    return True,'Estado actualizado correctamente.'
+
+
+
+
+
+
+
+def postular_a_convocatoria(postulante_id,convocatoria_id):
+
+
+
+    p=obtener_postulante(postulante_id); c=obtener_convocatoria_docente(convocatoria_id)
+
+
+
+    if not p or not c: return False,'No se encontró el postulante o la convocatoria.',None
+
+
+
+    if c['estado']!='Publicada': return False,'La convocatoria no está publicada.',None
+
+
+
+    falt=[et for campo,et in [('profesion','profesión'),('grado_academico','grado académico'),('especialidad','especialidad'),('disponibilidad','disponibilidad'),('cv_archivo','CV')] if not p.get(campo)]
+
+
+
+    if falt: return False,'Completa antes de postular: '+', '.join(falt),None
+
+
+
+    if fila('SELECT id FROM postulaciones_convocatorias WHERE convocatoria_id=%s AND postulante_id=%s',(convocatoria_id,postulante_id)): return False,'Ya postulaste a esta convocatoria.',None
+
+
+
+    i=ejecutar("INSERT INTO postulaciones_convocatorias(convocatoria_id,postulante_id,estado,fecha_postulacion,fecha_actualizacion) VALUES(%s,%s,'Recibido',%s,%s)",(convocatoria_id,postulante_id,ahora(),ahora()))
+
+
+
+    ejecutar("INSERT INTO postulacion_historial_estado(postulacion_id,estado,observacion,fecha) VALUES(%s,%s,%s,%s)",(i,'Recibido','Postulación enviada.',ahora()))
+
+
+
+    return True,'Postulación enviada correctamente.',i
+
+
+
+
+
+
+
+def obtener_postulaciones_postulante(postulante_id):
+
+
+
+    return filas("""SELECT pc.*,c.codigo,c.titulo,c.area_curso,c.modalidad,c.fecha_limite,n.nombre nivel_nombre,u.nombre unidad_nombre,p.nombre programa_nombre
+
+
+
+      FROM postulaciones_convocatorias pc JOIN convocatorias_docentes c ON pc.convocatoria_id=c.id
+
+
+
+      LEFT JOIN niveles_academicos n ON c.nivel_id=n.id LEFT JOIN unidades_academicas u ON c.unidad_id=u.id
+
+
+
+      LEFT JOIN programas_academicos p ON c.programa_id=p.id WHERE pc.postulante_id=%s ORDER BY pc.id DESC""",(postulante_id,))
+
+
+
+
+
+
+
+def obtener_postulaciones_convocatoria(convocatoria_id,estado=None):
+
+
+
+    sql="""SELECT pc.*,pd.dni,pd.nombres,pd.apellidos,pd.correo,pd.telefono,pd.profesion,pd.grado_academico,pd.especialidad,
+
+
+
+      pd.areas_interes,pd.disponibilidad,pd.cv_archivo,pd.cv_nombre_original,c.codigo,c.titulo
+
+
+
+      FROM postulaciones_convocatorias pc JOIN postulantes_docentes pd ON pc.postulante_id=pd.id
+
+
+
+      JOIN convocatorias_docentes c ON pc.convocatoria_id=c.id WHERE pc.convocatoria_id=%s"""
+
+
+
+    par=[convocatoria_id]
+
+
+
+    if estado and estado!='Todos': sql+=' AND pc.estado=%s'; par.append(estado)
+
+
+
+    return filas(sql+' ORDER BY pc.id DESC',tuple(par))
+
+
+
+
+
+
+
+def actualizar_estado_postulacion_convocatoria(i,estado,obs='',admin_id=None):
+
+
+
+    if estado not in ESTADOS_POSTULACION or estado=='Borrador': return False,'Estado no válido.'
+
+
+
+    ejecutar('UPDATE postulaciones_convocatorias SET estado=%s,observacion_admin=%s,revisado_por=%s,fecha_actualizacion=%s WHERE id=%s',(estado,obs,admin_id,ahora(),i))
+
+
+
+    ejecutar('INSERT INTO postulacion_historial_estado(postulacion_id,estado,observacion,cambiado_por,fecha) VALUES(%s,%s,%s,%s,%s)',(i,estado,obs,admin_id,ahora()))
+
+
+
+    registrar_auditoria(admin_id,'Actualizar estado','Postulaciones docentes',f'#{i}: {estado}')
+
+
+
+    return True,'Estado actualizado correctamente.'
+
+
+
+
+
+
+
+def obtener_historial_postulacion_convocatoria(i):
+
+
+
+    return filas('SELECT * FROM postulacion_historial_estado WHERE postulacion_id=%s ORDER BY id DESC',(i,))
+
+
+
+
+
+
+
+def metricas_convocatorias_docentes():
+
+
+
+    c=fila("SELECT COUNT(*) total,SUM(CASE WHEN estado='Publicada' THEN 1 ELSE 0 END) publicadas FROM convocatorias_docentes")
+
+
+
+    p=fila("""SELECT COUNT(*) total,SUM(CASE WHEN estado='Recibido' THEN 1 ELSE 0 END) recibidos,
+
+
+
+      SUM(CASE WHEN estado='En revisión' THEN 1 ELSE 0 END) revision,SUM(CASE WHEN estado='Apto' THEN 1 ELSE 0 END) aptos,
+
+
+
+      SUM(CASE WHEN estado='Entrevista' THEN 1 ELSE 0 END) entrevistas,SUM(CASE WHEN estado='Seleccionado' THEN 1 ELSE 0 END) seleccionados
+
+
+
+      FROM postulaciones_convocatorias""")
+
+
+
+    return {'convocatorias':c['total'] or 0,'publicadas':c['publicadas'] or 0,'postulaciones':p['total'] or 0,'recibidos':p['recibidos'] or 0,'revision':p['revision'] or 0,'aptos':p['aptos'] or 0,'entrevistas':p['entrevistas'] or 0,'seleccionados':p['seleccionados'] or 0}
