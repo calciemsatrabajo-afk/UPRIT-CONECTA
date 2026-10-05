@@ -5,3 +5,7 @@ pypdf
 python-docx
 openai
 XlsxWriter
+openpyxl
+psycopg2-binary
+requests
+Pillow
